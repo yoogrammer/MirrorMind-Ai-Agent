@@ -1,262 +1,399 @@
-
 """
-main.py
-Camera-based face mesh + facial metrics visualizer.
-AI is fully disabled for testing.
-"""
+mirrormind_voice_c_continuous.py
 
-import os
-import time
-import threading
-import json
-from queue import Queue, Empty
+Offline MirrorMind with continuous voice feedback:
+ - MediaPipe FaceMesh
+ - Rule-based emotion detection (voting)
+ - Non-blocking pyttsx3 TTS
+ - ALWAYS speaks full feedback continuously while face present
+ - Prints and displays full feedback on screen
+ - Auto camera detect, auto-close after NO_FACE_TIMEOUT, close by window X
+"""
 
 import cv2
-import mediapipe as mp
+import time
+import random
+import threading
+import queue
 import numpy as np
-import pyttsx3
-from PIL import Image
 
-# --- AI DISABLED ---
-def ask_ai_for_emotion_and_feedback(feature_summary):
-    return {
-        "emotion": "neutral",
-        "stress_level": "low",
-        "confidence": 0.0,
-        "feedback": "AI disabled — showing only camera & face detection."
-    }
+# -------- CONFIG --------
+MAX_CAMERA_INDEX = 4
+CAMERA_OPEN_TIMEOUT = 3.0
+NO_FACE_TIMEOUT = 5.0          # seconds without face -> exit
+SMOOTHING_WINDOW = 5
+USE_DSHOW = True               # on Windows prefer CAP_DSHOW
+VERBOSE = False                # set True to print feature details
 
-# No API key needed
-OPENAI_KEY = None
+# Test image (uploaded by you). Use by setting TEST_ON_IMAGE = True
+TEST_ON_IMAGE = False
+TEST_IMAGE_PATH = "/mnt/data/Screenshot 2025-11-22 202149.png"
 
-# --- Camera settings ---
-CAMERA_INDEX = 0
-NO_FACE_TIMEOUT = 10.0
-FEEDBACK_COOLDOWN = 6.0
-LANDMARK_HISTORY_SECONDS = 2.0
+# -------- FEEDBACK PHRASES --------
+FEEDBACK = {
+    "happy": [
+        "You look happy. Keep smiling.",
+        "Nice smile! That suits you.",
+        "Good to see you smiling."
+    ],
+    "sad": [
+        "You seem sad. It's okay, take a deep breath.",
+        "You look a bit down. Consider a short break.",
+        "If you need, pause and take care of yourself."
+    ],
+    "surprised": [
+        "You look surprised! Something unexpected happened?",
+        "That expression shows surprise.",
+        "Wow — that looks surprising."
+    ],
+    "angry": [
+        "You seem angry. Try a slow, deep breath to calm down.",
+        "Take a moment to relax your shoulders and breathe.",
+        "Consider a short pause to cool down."
+    ],
+    "tired": [
+        "You look tired. A short rest might help.",
+        "Maybe blink and take a quick break.",
+        "Your eyes look weary — consider resting them."
+    ],
+    "confused": [
+        "You might be confused. Take your time to think it through.",
+        "You seem uncertain. Asking a question can help.",
+        "If unsure, pause and reflect for a moment."
+    ],
+    "neutral": [
+        "You look calm and neutral.",
+        "A peaceful expression — all looks fine.",
+        "You appear composed."
+    ],
+}
 
-# --- MediaPipe setup ---
-mp_face_mesh = mp.solutions.face_mesh
-face_mesh = mp_face_mesh.FaceMesh(
-    static_image_mode=False,
-    max_num_faces=1,
-    refine_landmarks=True,
-    min_detection_confidence=0.5,
-    min_tracking_confidence=0.5
-)
+# -------- Non-blocking TTS worker --------
+try:
+    import pyttsx3
+    TTS_AVAILABLE = True
+except Exception:
+    pyttsx3 = None
+    TTS_AVAILABLE = False
 
-mp_drawing = mp.solutions.drawing_utils
+class TTSWorker:
+    def __init__(self):
+        self.enabled = TTS_AVAILABLE
+        self.q = queue.Queue()
+        self.thread = None
+        self.running = False
+        if self.enabled:
+            self.engine = pyttsx3.init()
+            self.engine.setProperty("rate", 165)
+            self.engine.setProperty("volume", 1.0)
 
-# --- TTS (still works but not used by AI now) ---
-tts_engine = pyttsx3.init()
-tts_engine.setProperty("rate", 165)
-tts_engine.setProperty("volume", 1.0)
+    def start(self):
+        if not self.enabled or (self.thread and self.thread.is_alive()):
+            return
+        self.running = True
+        self.thread = threading.Thread(target=self._loop, daemon=True)
+        self.thread.start()
 
-# --- Helper functions ---
-def landmarks_to_np(landmarks, shape):
-    h, w = shape[:2]
-    pts = np.array([(int(lm.x * w), int(lm.y * h)) for lm in landmarks], dtype=np.int32)
-    return pts
+    def _loop(self):
+        while self.running:
+            try:
+                text = self.q.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            try:
+                self.engine.say(text)
+                self.engine.runAndWait()
+            except Exception as e:
+                print("TTS error:", e)
 
-def mouth_aspect_ratio(pts):
-    try:
-        top = pts[13]
-        bottom = pts[14]
-        left = pts[61]
-        right = pts[291]
-        vert = np.linalg.norm(top - bottom)
-        hor = np.linalg.norm(left - right) + 1e-6
-        return float(vert / hor)
-    except Exception:
-        return 0.0
-
-def eye_aspect_ratio(pts, left=True):
-    try:
-        if left:
-            idx = [33, 159]
-            corners = [33, 133]
-        else:
-            idx = [362, 386]
-            corners = [362, 263]
-
-        top = pts[idx[0]]
-        bottom = pts[idx[1]]
-        leftc = pts[corners[0]]
-        rightc = pts[corners[1]]
-
-        vert = np.linalg.norm(top - bottom)
-        hor = np.linalg.norm(leftc - rightc) + 1e-6
-        return float(vert / hor)
-    except Exception:
-        return 0.0
-
-def brow_raise_metric(pts):
-    try:
-        left_brow = pts[105]
-        left_eye_top = pts[159]
-        right_brow = pts[334]
-        right_eye_top = pts[386]
-        h = np.linalg.norm(pts[10] - pts[152]) + 1e-6
-        dist = (np.linalg.norm(left_brow - left_eye_top) + np.linalg.norm(right_brow - right_eye_top)) / 2.0
-        return float(dist / h)
-    except Exception:
-        return 0.0
-
-def head_tilt_metric(pts):
-    try:
-        left = pts[234]
-        right = pts[454]
-        nose = pts[1]
-        denom = np.linalg.norm(right - left) + 1e-6
-        rel = (nose[0] - left[0]) / denom
-        return float(rel)
-    except Exception:
-        return 0.5
-
-def summarize_features(flist):
-    arr = np.array(flist)
-    mean = np.mean(arr, axis=0)
-    std = np.std(arr, axis=0)
-    return {
-        "mar_mean": float(mean[0]), "mar_std": float(std[0]),
-        "earL_mean": float(mean[1]), "earL_std": float(std[1]),
-        "earR_mean": float(mean[2]), "earR_std": float(std[2]),
-        "brow_mean": float(mean[3]), "brow_std": float(std[3]),
-        "head_rel_mean": float(mean[4]), "head_rel_std": float(std[4]),
-        "samples": int(arr.shape[0])
-    }
-
-# --- Worker thread (AI disabled but keep structure) ---
-ai_request_queue = Queue()
-ai_response_queue = Queue()
-
-def ai_worker():
-    while True:
-        task = ai_request_queue.get()
-        if task is None:
-            break
-        result = ask_ai_for_emotion_and_feedback(task)
-        ai_response_queue.put(result)
-
-ai_thread = threading.Thread(target=ai_worker, daemon=True)
-ai_thread.start()
-
-# --- Main camera loop ---
-def main_loop():
-    cap = cv2.VideoCapture(CAMERA_INDEX)
-    last_face_time = time.time()
-    last_feedback_time = 0.0
-    landmark_buffer = []
-    last_ai_result = None
-
-    if not cap.isOpened():
-        print("Unable to open camera.")
-        return
-
-    window_name = "Emotion Detector (AI disabled)"
-    cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
-    cv2.resizeWindow(window_name, 900, 700)
-
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            print("Camera frame not received.")
-            break
-
-        frame = cv2.flip(frame, 1)
-        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        results = face_mesh.process(rgb)
-
-        h, w = frame.shape[:2]
-        face_present = False
-
-        if results.multi_face_landmarks:
-            face_present = True
-            last_face_time = time.time()
-
-            face_landmarks = results.multi_face_landmarks[0].landmark
-            pts = landmarks_to_np(face_landmarks, frame.shape)
-
-            mar = mouth_aspect_ratio(pts)
-            earL = eye_aspect_ratio(pts, left=True)
-            earR = eye_aspect_ratio(pts, left=False)
-            brow = brow_raise_metric(pts)
-            head_rel = head_tilt_metric(pts)
-
-            ts = time.time()
-            landmark_buffer.append((ts, (mar, earL, earR, brow, head_rel)))
-
-            cutoff = ts - LANDMARK_HISTORY_SECONDS
-            landmark_buffer = [(t, v) for (t, v) in landmark_buffer if t >= cutoff]
-
-            mp_drawing.draw_landmarks(
-                frame,
-                results.multi_face_landmarks[0],
-                mp_face_mesh.FACEMESH_TESSELATION,
-                mp_drawing.DrawingSpec(color=(0, 255, 0), thickness=1, circle_radius=1),
-                mp_drawing.DrawingSpec(color=(0, 128, 255), thickness=1),
-            )
-
-            x_min = np.min(pts[:, 0])
-            x_max = np.max(pts[:, 0])
-            y_min = np.min(pts[:, 1])
-            y_max = np.max(pts[:, 1])
-            cv2.rectangle(frame, (x_min - 10, y_min - 10), (x_max + 10, y_max + 10), (255, 200, 0), 2)
-
-            now = time.time()
-            if (now - last_feedback_time) > FEEDBACK_COOLDOWN and len(landmark_buffer) >= 5:
-                flist = [v for (t, v) in landmark_buffer]
-                summary = summarize_features(flist)
-                ai_request_queue.put(summary)
-                last_feedback_time = now
-
-            cv2.putText(
-                frame,
-                f"MAR:{mar:.2f} EAR_L:{earL:.2f} EAR_R:{earR:.2f} BROW:{brow:.2f}",
-                (10, 30),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.6,
-                (255, 255, 255),
-                2,
-            )
-
-        # AI result (dummy)
+    def speak(self, text):
+        if not self.enabled:
+            print("[TTS unavailable] " + text)
+            return
         try:
-            ai_result = ai_response_queue.get_nowait()
-            last_ai_result = ai_result
-        except Empty:
+            self.q.put_nowait(text)
+        except queue.Full:
             pass
 
-        if last_ai_result:
-            text_block = (
-                f"Emotion: {last_ai_result['emotion']} | Stress: {last_ai_result['stress_level']}\n"
-                f"{last_ai_result['feedback']}"
-            )
-            overlay_img = frame.copy()
-            cv2.rectangle(overlay_img, (10, h - 110), (w - 10, h - 10), (0, 0, 0), -1)
-            alpha = 0.45
-            cv2.addWeighted(overlay_img, alpha, frame, 1 - alpha, 0, frame)
+    def stop(self):
+        self.running = False
 
-            y0 = h - 90
-            for i, line in enumerate(text_block.split("\n")):
-                cv2.putText(frame, line, (20, y0 + i * 25), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+# -------- MediaPipe availability --------
+try:
+    import mediapipe as mp
+    MP_AVAILABLE = True
+except Exception as e:
+    mp = None
+    MP_AVAILABLE = False
+    print("ERROR: mediapipe not available. Install with: pip install mediapipe")
 
-        cv2.imshow(window_name, frame)
+# -------- Landmark indices --------
+LIP_TOP = 13
+LIP_BOTTOM = 14
+MOUTH_LEFT = 61
+MOUTH_RIGHT = 291
+EYE_L_TOP = 159
+EYE_L_BOTTOM = 145
+EYE_R_TOP = 386
+EYE_R_BOTTOM = 374
+BROW_L = 105
+BROW_R = 334
+CHEEK_L = 234
+CHEEK_R = 454
+NOSE_TOP = 1
+CHIN = 152
 
-        if (time.time() - last_face_time) > NO_FACE_TIMEOUT:
-            print("No face detected for 10 seconds. Exiting.")
-            break
+def landmarks_to_pixel_array(landmarks, shape):
+    h, w = shape[:2]
+    pts = []
+    for lm in landmarks:
+        pts.append((int(lm.x * w), int(lm.y * h)))
+    return np.array(pts)
 
-        if cv2.waitKey(1) & 0xFF == 27:
-            break
+# -------- Features --------
+def face_width(pts):
+    try:
+        return np.linalg.norm(pts[CHEEK_R] - pts[CHEEK_L])
+    except:
+        return float(np.max(pts[:,0]) - np.min(pts[:,0]) + 1e-6)
 
+def face_height(pts):
+    try:
+        return np.linalg.norm(pts[CHIN] - pts[NOSE_TOP])
+    except:
+        return float(np.max(pts[:,1]) - np.min(pts[:,1]) + 1e-6)
+
+def compute_features(pts):
+    fw = face_width(pts) + 1e-6
+    fh = face_height(pts) + 1e-6
+
+    mouth_w = np.linalg.norm(pts[MOUTH_RIGHT] - pts[MOUTH_LEFT])
+    mouth_open = np.linalg.norm(pts[LIP_TOP] - pts[LIP_BOTTOM])
+
+    lip_center_y = (pts[LIP_TOP][1] + pts[LIP_BOTTOM][1]) / 2.0
+    lift_left = lip_center_y - pts[MOUTH_LEFT][1]
+    lift_right = lip_center_y - pts[MOUTH_RIGHT][1]
+    lip_lift = (lift_left + lift_right) / 2.0
+
+    cheek_left = np.linalg.norm(pts[CHEEK_L] - pts[EYE_L_TOP])
+    cheek_right = np.linalg.norm(pts[CHEEK_R] - pts[EYE_R_TOP])
+    cheek_avg = (cheek_left + cheek_right) / 2.0
+
+    eye_l = np.linalg.norm(pts[EYE_L_TOP] - pts[EYE_L_BOTTOM])
+    eye_r = np.linalg.norm(pts[EYE_R_TOP] - pts[EYE_R_BOTTOM])
+    eye_avg = (eye_l + eye_r) / 2.0
+
+    brow_left = np.linalg.norm(pts[BROW_L] - pts[EYE_L_TOP])
+    brow_right = np.linalg.norm(pts[BROW_R] - pts[EYE_R_TOP])
+    brow_avg = (brow_left + brow_right) / 2.0
+
+    return {
+        "mouth_width_ratio": mouth_w / fw,
+        "mouth_open_ratio": mouth_open / fh,
+        "lip_lift_norm": lip_lift / fh * 100.0,
+        "cheek_norm": cheek_avg / fh,
+        "eye_ratio": eye_avg / fw,
+        "brow_ratio": brow_avg / fh,
+        "raw_mouth_w": mouth_w,
+        "raw_mouth_open": mouth_open,
+        "face_w": fw,
+        "face_h": fh
+    }
+
+# -------- Emotion Voting --------
+def vote_emotion(feats):
+    votes = {}
+    def add(e, w=1):
+        votes[e] = votes.get(e, 0) + w
+
+    mw = feats["mouth_width_ratio"]
+    mo = feats["mouth_open_ratio"]
+    lift = feats["lip_lift_norm"]
+    cheek = feats["cheek_norm"]
+    eye = feats["eye_ratio"]
+    brow = feats["brow_ratio"]
+
+    if mw > 0.32 and lift > 2.5 and cheek < 0.50:
+        add("happy", 2)
+    elif mw > 0.28 and lift > 1.6:
+        add("happy", 1)
+
+    if mo > 0.12 and eye > 0.045 and brow > 0.085:
+        add("surprised", 2)
+    elif mo > 0.10 and eye > 0.05:
+        add("surprised", 1)
+
+    if brow < 0.055 and eye < 0.03:
+        add("angry", 2)
+    elif brow < 0.06 and eye < 0.035:
+        add("angry", 1)
+
+    if lift < 1.0 and mw < 0.28 and eye > 0.03:
+        add("sad", 1)
+
+    if eye < 0.018:
+        add("tired", 2)
+    elif eye < 0.025:
+        add("tired", 1)
+
+    if mo > 0.06 and abs(brow - 0.08) > 0.03:
+        add("confused", 1)
+
+    if not votes:
+        add("neutral", 1)
+
+    priority = ["surprised", "happy", "angry", "sad", "tired", "confused", "neutral"]
+    max_vote = max(votes.values())
+    candidates = [k for k, v in votes.items() if v == max_vote]
+    for p in priority:
+        if p in candidates:
+            return p, votes, feats
+    return candidates[0], votes, feats
+
+# -------- Camera --------
+def try_open_camera(index, use_dshow=False, timeout=CAMERA_OPEN_TIMEOUT):
+    try:
+        cap = cv2.VideoCapture(index, cv2.CAP_DSHOW if use_dshow else 0)
+    except:
+        return None
+    if not cap or not cap.isOpened():
+        return None
+    start = time.time()
+    while time.time() - start < timeout:
+        ret, frame = cap.read()
+        if ret and frame is not None:
+            return cap
+        time.sleep(0.08)
     cap.release()
-    cv2.destroyAllWindows()
-    ai_request_queue.put(None)
-    print("Program ended.")
+    return None
+
+def find_camera(max_index=MAX_CAMERA_INDEX, use_dshow=USE_DSHOW):
+    for i in range(max_index + 1):
+        cap = try_open_camera(i, use_dshow)
+        if cap:
+            return cap, i
+    return None, None
+
+# -------- Main --------
+def main():
+    if not MP_AVAILABLE:
+        print("ERROR: mediapipe not available. Install with: pip install mediapipe")
+        return
+
+    tts = TTSWorker()
+    tts.start()
+
+    mp_face_mesh = mp.solutions.face_mesh
+    mp_drawing = mp.solutions.drawing_utils
+    face_mesh = mp_face_mesh.FaceMesh(static_image_mode=False, max_num_faces=1,
+                                      refine_landmarks=True, min_detection_confidence=0.5,
+                                      min_tracking_confidence=0.5)
+
+    # TEST IMAGE MODE
+    if TEST_ON_IMAGE:
+        img = cv2.imread(TEST_IMAGE_PATH)
+        if img is None:
+            print("ERROR: Test image not found:", TEST_IMAGE_PATH)
+            return
+        rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        res = face_mesh.process(rgb)
+        if not res.multi_face_landmarks:
+            print("No face in test image.")
+            cv2.imshow("Test", img)
+            cv2.waitKey(0)
+            return
+        pts = landmarks_to_pixel_array(res.multi_face_landmarks[0].landmark, img.shape)
+        emotion, votes, feats = vote_emotion(compute_features(pts))
+        phrase = random.choice(FEEDBACK.get(emotion, FEEDBACK["neutral"]))
+        text = f"Emotion detected: {emotion}. {phrase}"
+        tts.speak(text)
+        print("Spoken (test image):", text)
+        mp_drawing.draw_landmarks(img, res.multi_face_landmarks[0], mp_face_mesh.FACEMESH_TESSELATION,
+                                   mp_drawing.DrawingSpec(color=(0,255,0), thickness=1, circle_radius=1),
+                                   mp_drawing.DrawingSpec(color=(0,128,255), thickness=1))
+        cv2.putText(img, text, (20,40), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,255), 2, cv2.LINE_AA)
+        cv2.imshow("Test", img)
+        cv2.waitKey(0)
+        return
+
+    # FIND CAMERA
+    cap, idx = find_camera()
+    if cap is None:
+        print("ERROR: No camera found.")
+        return
+
+    win = "MirrorMind Continuous Voice"
+    cv2.namedWindow(win, cv2.WINDOW_NORMAL)
+    cv2.resizeWindow(win, 960, 720)
+
+    last_face_time = time.time()
+    history = []
+
+    try:
+        while True:
+            ret, frame = cap.read()
+            if not ret or frame is None:
+                if time.time() - last_face_time > 2.0:
+                    print("ERROR: Camera frame stopped.")
+                    break
+                time.sleep(0.02)
+                continue
+
+            frame = cv2.flip(frame, 1)
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            res = face_mesh.process(rgb)
+
+            if res and res.multi_face_landmarks:
+                last_face_time = time.time()
+                lm = res.multi_face_landmarks[0].landmark
+                pts = landmarks_to_pixel_array(lm, frame.shape)
+
+                feats = compute_features(pts)
+                emotion, votes, feats = vote_emotion(feats)
+
+                # smoothing
+                history.append(emotion)
+                if len(history) > SMOOTHING_WINDOW:
+                    history.pop(0)
+                emotion = max(set(history), key=history.count)
+
+                phrase = random.choice(FEEDBACK.get(emotion, FEEDBACK["neutral"]))
+                text = f"Emotion detected: {emotion}. {phrase}"
+
+                # overlay
+                mp_drawing.draw_landmarks(frame, res.multi_face_landmarks[0], mp_face_mesh.FACEMESH_TESSELATION,
+                                          mp_drawing.DrawingSpec(color=(0,255,0), thickness=1, circle_radius=1),
+                                          mp_drawing.DrawingSpec(color=(0,128,255), thickness=1))
+                cv2.putText(frame, text, (20,40), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,255), 2, cv2.LINE_AA)
+
+                # continuously speak
+                tts.speak(text)
+
+            else:
+                cv2.putText(frame, "No face detected", (20,40), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0,0,255), 2)
+
+            cv2.imshow(win, frame)
+
+            # auto-close if no face
+            if time.time() - last_face_time > NO_FACE_TIMEOUT:
+                break
+
+            if cv2.getWindowProperty(win, cv2.WND_PROP_VISIBLE) < 1:
+                break
+
+            if cv2.waitKey(1) & 0xFF == 27:
+                break
+
+    except KeyboardInterrupt:
+        pass
+    finally:
+        try:
+            face_mesh.close()
+        except:
+            pass
+        cap.release()
+        cv2.destroyAllWindows()
+        tts.stop()
 
 if __name__ == "__main__":
-    try:
-        main_loop()
-    except Exception as e:
-        print("Fatal error:", e)
+    main()
